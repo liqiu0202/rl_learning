@@ -10,16 +10,17 @@ import matplotlib.pyplot as plt
 import random
 import os
 from datetime import datetime
+from utils import record_video
 
 # hyperparamebers to tune
 learning_rate =  1e-4
-gamma = 0.99
+gamma = 0.9
 
 debug = False
 
 # File path to the model
-policy_model_path = "nn_policy_model.pth"
-value_model_path = "nn_value_model.pth"
+policy_model_path = "policy_model.pth"
+value_model_path = "value_model.pth"
 video_fps = 30
 # video_path = 'replay.mp4'
 
@@ -78,6 +79,19 @@ class Policy(nn.Module):
     def forward(self, x):
         return self.mlp(x)
     
+    # action(st), H(st) -> at based on probability distribution
+    def take_action(self, s):
+        logits = self.mlp(s)
+        probs = torch.softmax(logits, dim=-1)
+        categorical_dist = torch.distributions.Categorical(probs = probs)
+        action = categorical_dist.sample()
+        return action.item()
+
+    def get_logp(self, obs, acts):
+        logits = self.mlp(obs)
+        categorical_dists = torch.distributions.Categorical(logits = logits)
+        return categorical_dists.log_prob(acts)
+    
 class Value(nn.Module):
     # (TODO) MLP/Policy can be reconfigured to contain multiple layers
     def __init__(self, dim_input, dim_hidden):
@@ -96,24 +110,6 @@ class Value(nn.Module):
         return self.mlp(x)
 
 
-# action(st), H(st) -> at based on probability distribution
-def take_action(policy, s):
-    logits = policy(s)
-    probs = torch.softmax(logits, dim=-1)
-    categorical_dist = torch.distributions.Categorical(probs = probs)
-    action = categorical_dist.sample()
-    return action.item()
-
-def get_logp(policy, obs, acts):
-    logits = policy(obs)
-    categorical_dists = torch.distributions.Categorical(logits = logits)
-    return categorical_dists.log_prob(acts)
-
-def get_values(value, obs):
-    baselines = value(obs)
-    return baselines
-
-    
 # return loss, avg_reward, avg_lens for this epoch
 def train_epoch(env, policy, value, num_batch, policy_opt, value_opt):
     # return [(st, at, reward, st+1, done)]
@@ -123,7 +119,7 @@ def train_epoch(env, policy, value, num_batch, policy_opt, value_opt):
             st = env.reset()
             done = False
             while not done:
-                action = take_action(policy, torch.tensor(st))
+                action = policy.take_action(torch.tensor(st))
                 st_1, reward, done, _ = env.step(action)
                 batch_traj.append((st, action, reward, st_1, done))
                 st = st_1
@@ -139,6 +135,8 @@ def train_epoch(env, policy, value, num_batch, policy_opt, value_opt):
                 # append rewards to gos from current trajectory to rtgs
                 rtgs.extend(get_rtgs_from_current_traj(curr_traj))
                 curr_traj = []
+        # normalize reward
+        rtgs = (rtgs - np.mean(rtgs)) / (1e-9 + np.std(rtgs))
         return rtgs
                 
     def get_rtgs_from_current_traj(curr_traj):
@@ -153,16 +151,14 @@ def train_epoch(env, policy, value, num_batch, policy_opt, value_opt):
         return rtgs 
     
     # traj: [(st, at, reward, st+1, done)]
-    def fit_value_evaluation(value, value_opt, batch_traj):
+    def fit_value_evaluation(value, value_opt, batch_traj, batch_rtgs):
         predications = []
-        targets = []
+        # episode_in_traj = []
         for st, at, reward, st_1, done in batch_traj:
             v_st = value(torch.as_tensor(st))
-            v_st_1 = value(torch.as_tensor(st_1))
             predications.append(v_st)
-            targets.append(reward + gamma * v_st_1)
         value_opt.zero_grad()
-        targets = torch.as_tensor(targets, dtype=torch.float64)
+        targets = torch.as_tensor(batch_rtgs, dtype=torch.float64)
         predications = torch.stack(predications).squeeze(-1)
         loss = nn.MSELoss()(predications, targets)
         loss.backward()
@@ -170,20 +166,20 @@ def train_epoch(env, policy, value, num_batch, policy_opt, value_opt):
         return loss.item()
         
     
-    def fit_policy_evaluation(policy, policy_opt, batch_traj, value):
+    def fit_policy_evaluation(policy, policy_opt, batch_traj, value, batch_rtgs):
         batch_adv = [] # [tensor(torch.double)]
+        batch_baseline = []
         batch_st = []
         batch_at = []
         # compute adv(st, at)
         with torch.no_grad():
             for st, at, reward, st_1, done in batch_traj:
                 v_st = value(torch.as_tensor(st)).item()
-                v_st_1 = value(torch.as_tensor(st_1)).item()
-                batch_adv.append(reward + gamma * v_st_1 - v_st)
+                batch_baseline.append(v_st)
                 batch_st.append(st)
                 batch_at.append(at)
-        batch_adv = torch.as_tensor(batch_adv)
-        logps = get_logp(policy = policy, obs= torch.as_tensor(batch_st), acts = torch.as_tensor(batch_at))
+        batch_adv = torch.as_tensor(batch_rtgs) - torch.as_tensor(batch_baseline)
+        logps = policy.get_logp(obs= torch.as_tensor(batch_st), acts = torch.as_tensor(batch_at))
         loss = -(logps * batch_adv).mean()
         policy_opt.zero_grad()
         loss.backward()
@@ -209,11 +205,11 @@ def train_epoch(env, policy, value, num_batch, policy_opt, value_opt):
         
     # start = timer()
     batch_traj = generate_trajectory(env, policy, num_batch)
-    # batch_rtgs = compute_reward_to_go(batch_traj)
+    batch_rtgs = compute_reward_to_go(batch_traj)
     print_trajectories(batch_traj)
-    # print_rewards(batch_rtgs)
-    v_loss = fit_value_evaluation(value = value, value_opt=value_opt, batch_traj=batch_traj)
-    p_loss = fit_policy_evaluation(policy = policy, policy_opt = policy_opt, batch_traj = batch_traj, value = value)
+    print_rewards(batch_rtgs)
+    v_loss = fit_value_evaluation(value = value, value_opt=value_opt, batch_traj=batch_traj, batch_rtgs=batch_rtgs)
+    p_loss = fit_policy_evaluation(policy = policy, policy_opt = policy_opt, batch_traj = batch_traj, value = value, batch_rtgs=batch_rtgs)
     reward_mean, reward_std, len_mean = evaluate_policy(batch_traj)
     
     return p_loss, v_loss, reward_mean, len_mean, reward_std
@@ -225,12 +221,12 @@ def train():
     dim_output = env.action_space.n
     policy = Policy(dim_input, 32, dim_output).double()
     value = Value(dim_input, 32).double()
-    load_model(policy, policy_model_path)
-    load_model(value, value_model_path)
+    # load_model(policy, policy_model_path)
+    # load_model(value, value_model_path)
     policy_opt = torch.optim.Adam(policy.parameters(), lr = learning_rate)
     value_opt = torch.optim.Adam(value.parameters(), lr = learning_rate)
 
-    num_epoch = 500
+    num_epoch = 1000
     num_batch = 10
     rewards = []
     reward_std = []
@@ -243,16 +239,18 @@ def train():
         rewards.append(reward)
         reward_std.append(reward_st)
     print(f'total time for traning: {timer() - start}')
+    mean_minus_std = ((torch.as_tensor(rewards) - torch.as_tensor(reward_std))).numpy()
     plt.plot(list(range(num_epoch)), rewards, marker='o', linestyle='-', label='Rewards per Epoch')
     plt.plot(list(range(num_epoch)), reward_std, marker='s', linestyle='--',  color='red', label='std per Epoch')
+    # plt.plot(list(range(num_epoch)), mean_minus_std, marker='s', linestyle='-',  color='green', label='mean - std per Epoch')
     plt.xlabel('Epochs')
     plt.ylabel('Rewards')
     plt.title('Rewards per Epoch')
     plt.legend()
     plt.grid(True)
     plt.show()
-    save_model(policy, policy_model_path)
-    save_model(value, value_model_path)
+    # save_model(policy, policy_model_path)
+    # save_model(value, value_model_path)
     policy.eval()
     current_time = datetime.now()
 
@@ -261,7 +259,7 @@ def train():
 
     # Append the formatted time to the string 'replay'
     video_path = f"replay-{formatted_time}.mp4"
-    # record_video(env, policy, video_path, video_fps)
+    record_video(env, policy, video_path, video_fps)
 
 if __name__ == "__main__":
     train()
